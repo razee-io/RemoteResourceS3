@@ -1,4 +1,4 @@
-# This repo will be deprecated and unsupported starting January 2022
+# This repo will be deprecated and unsupported starting February 2022
 
 ### Please move to using [RemoteResource](https://github.com/razee-io/RemoteResource) which now supports all capabilities of RemoteResourceS3
 
