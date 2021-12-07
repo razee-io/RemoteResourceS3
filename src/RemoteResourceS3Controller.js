@@ -16,14 +16,18 @@
 
 const objectPath = require('object-path');
 const request = require('request-promise-native');
-const fs = require('fs-extra');
-const hash = require('object-hash');
-const axios = require('axios');
 const merge = require('deepmerge');
 const xml2js = require('xml2js');
 const clone = require('clone');
 const loggerFactory = require('./bunyan-api');
 const { BaseDownloadController } = require('@razee/razeedeploy-core');
+const IamTokenGetter = require('./iam-token');
+
+// we need to create only one instance of IamTokenGetter, so we are creating
+// it here and not within the Download function. If we create it in the Download
+// function we will end up creating a new IamTokenGetter for each event and
+// call IAM multiple times to get token instead of just once per expiry interval
+const iamTokenGetter = new IamTokenGetter();
 
 
 module.exports = class RemoteResourceS3Controller extends BaseDownloadController {
@@ -61,7 +65,7 @@ module.exports = class RemoteResourceS3Controller extends BaseDownloadController
       objectPath.set(options, 'aws.key', accessKeyId);
       objectPath.set(options, 'aws.secret', secretAccessKey);
     } else if (iam) {
-      let bearerToken = await this._fetchS3Token(iam);
+      const bearerToken = await iamTokenGetter.fetchS3Token(iam, this.kubeResourceMeta, this.namespace);
       objectPath.set(options, 'headers.Authorization', `bearer ${bearerToken}`);
     }
     let opt = merge(reqOpt, options);
@@ -192,88 +196,6 @@ module.exports = class RemoteResourceS3Controller extends BaseDownloadController
     }
 
     return { accessKeyId: akid, secretAccessKey: sak };
-  }
-
-  async _fetchS3Token(iam) {
-    let apiKey;
-    let apiKeyAlpha1 = objectPath.get(iam, 'api_key');
-    let apiKeyStr = objectPath.get(iam, 'apiKey');
-    let apiKeyRef = objectPath.get(iam, 'apiKeyRef');
-
-    if (typeof apiKeyAlpha1 == 'string') {
-      apiKey = apiKeyAlpha1;
-    } else if (typeof apiKeyStr == 'string') {
-      apiKey = apiKeyStr;
-    } else if (typeof apiKeyAlpha1 == 'object') {
-      let secretName = objectPath.get(apiKeyAlpha1, 'valueFrom.secretKeyRef.name');
-      let secretNamespace = objectPath.get(apiKeyAlpha1, 'valueFrom.secretKeyRef.namespace', this.namespace);
-      let secretKey = objectPath.get(apiKeyAlpha1, 'valueFrom.secretKeyRef.key');
-      apiKey = await this._getSecretData(secretName, secretKey, secretNamespace);
-    } else if (typeof apiKeyRef == 'object') {
-      let secretName = objectPath.get(apiKeyRef, 'valueFrom.secretKeyRef.name');
-      let secretNamespace = objectPath.get(apiKeyRef, 'valueFrom.secretKeyRef.namespace', this.namespace);
-      let secretKey = objectPath.get(apiKeyRef, 'valueFrom.secretKeyRef.key');
-      apiKey = await this._getSecretData(secretName, secretKey, secretNamespace);
-    }
-    if (!apiKey) {
-      return Promise.reject('Failed to find valid apikey to authenticate against iam');
-    }
-
-    let res = await this._requestToken(iam, apiKey);
-    return res.access_token;
-  }
-
-
-  async _requestToken(iam, apiKey) {
-    let token;
-    if (this.s3TokenCache === undefined) {
-      this.s3TokenCache = {};
-    }
-    const apiKeyHash = hash(apiKey, { algorithm: 'shake256' });
-    let tokenCacheFile = `./download-cache/s3token-cache/${apiKeyHash}.json`;
-    if (token === undefined && await fs.pathExists(tokenCacheFile)) {
-      // fetch cached token
-      if (objectPath.has(this.s3TokenCache, [apiKeyHash])) {
-        token = objectPath.get(this.s3TokenCache, [apiKeyHash]);
-      } else if (await fs.pathExists(tokenCacheFile)) {
-        token = await fs.readJson(tokenCacheFile);
-        objectPath.set(this.s3TokenCache, [apiKeyHash], token);
-      }
-    }
-    if (token !== undefined) {
-      const expires = objectPath.get(token, 'expiration', 0); // expiration: time since epoch in seconds
-      // re-use cached token as long as we are more than 2 minutes away from expiring.
-      if (Date.now() < (expires - 120) * 1000) {
-        return token;
-      }
-    }
-
-    try {
-      let res = await axios({
-        method: 'post',
-        url: iam.url, // 'https://iam.cloud.ibm.com/identity/token',
-        params: {
-          'grant_type': iam.grantType || iam.grant_type, // 'urn:ibm:params:oauth:grant-type:apikey',
-          'apikey': apiKey
-        },
-        // data: `grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey=${apiKey}`,
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        timeout: 60000
-      });
-      token = res.data;
-      try {
-        await fs.outputJson(tokenCacheFile, token);
-        objectPath.set(this.s3TokenCache, [apiKeyHash], token);
-      } catch (fe) {
-        return Promise.reject(`failed to cache s3Token to disk at path ${tokenCacheFile}`, fe);
-      }
-      return token;
-    } catch (err) {
-      const error = Buffer.isBuffer(err) ? err.toString('utf8') : err;
-      return Promise.reject(error.toJSON());
-    }
   }
 
   async _getSecretData(name, key, ns) {
